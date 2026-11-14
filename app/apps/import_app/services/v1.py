@@ -41,6 +41,17 @@ from apps.import_app.schemas.v1 import (
 
 logger = logging.getLogger(__name__)
 
+# QIF sections that hold transactions. Others, like category lists (!Type:Cat)
+# or memorized transactions (!Type:Memorized), are skipped
+QIF_TRANSACTION_SECTIONS = {
+    "!type:bank",
+    "!type:cash",
+    "!type:ccard",
+    "!type:invst",
+    "!type:oth a",
+    "!type:oth l",
+}
+
 
 class ImportService:
     def __init__(self, import_run: ImportRun):
@@ -992,6 +1003,10 @@ class ImportService:
         raw_lines_buffer = []
         # How many times each transaction's raw lines have been seen in this file
         occurrences = Counter()
+        legacy_contents_seen = set()
+        in_account_list = False
+        in_account_block = False
+        in_other_section = False
 
         account = (
             self.import_run.account or Account.objects.filter(name=account_name).first()
@@ -1006,12 +1021,39 @@ class ImportService:
             if not line:
                 continue
 
+            # Account blocks (!Account, or an !Option:AutoSwitch account list)
+            # and non-transaction sections use codes that mean something else
+            # in a transaction, e.g. T is an account's type and D its description
+            header = line.lower()
+            if header == "!option:autoswitch":
+                in_account_list = True
+            elif header == "!clear:autoswitch":
+                in_account_list = False
+            elif header == "!account":
+                in_account_block = True
+            elif header.startswith("!type:"):
+                in_other_section = header not in QIF_TRANSACTION_SECTIONS
+                if in_other_section:
+                    self._log("info", f"Skipped {line} section in {filename}")
+            if in_account_list or in_account_block or in_other_section:
+                if line == "^":
+                    in_account_block = False
+                    raw_lines_buffer = []
+                continue
+
             raw_lines_buffer.append(line)
 
             if line == "^":
                 if current_transaction:
-                    # Deduplication using hash of raw lines
-                    raw_content = "".join(raw_lines_buffer)
+                    # Deduplication using hash of raw lines. Header lines (!Type,
+                    # !Account) are left out so a transaction hashes the same
+                    # whether or not it comes right after one
+                    legacy_content = "".join(raw_lines_buffer)
+                    raw_content = "".join(
+                        raw_line
+                        for raw_line in raw_lines_buffer
+                        if not raw_line.startswith("!")
+                    )
                     occurrence = occurrences[raw_content]
                     occurrences[raw_content] += 1
                     internal_id = self._qif_internal_id(
@@ -1022,13 +1064,15 @@ class ImportService:
                     raw_lines_buffer = []
 
                     duplicate_filter = Q(internal_id=internal_id)
-                    if occurrence == 0:
+                    if legacy_content not in legacy_contents_seen:
                         # Transactions imported before the account and the
                         # occurrence were part of the hash used the raw lines
-                        # alone, and only ever kept the first of identical ones
+                        # alone, headers included, and only ever kept the first
+                        # of identical ones
+                        legacy_contents_seen.add(legacy_content)
                         duplicate_filter |= Q(
                             internal_id=hashlib.sha256(
-                                raw_content.encode("utf-8")
+                                legacy_content.encode("utf-8")
                             ).hexdigest(),
                             account=account,
                         )

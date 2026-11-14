@@ -375,6 +375,120 @@ mapping: {}
         self.assertEqual(into_savings.skipped_rows, 0)
         self.assertEqual(Transaction.objects.filter(account=savings).count(), 3)
 
+    def test_import_overlapping_exports_with_a_different_first_transaction(self):
+        # The first coffee opens the second export, right after the header
+        later_export = """!Type:Bank
+D05/01/2015
+T-4.50
+PCoffee Shop
+^
+D06/01/2015
+T-20.00
+PMarket
+^
+"""
+        self._import_qif(IDENTICAL_TRANSACTIONS_CONTENT)
+
+        run = self._import_qif(later_export)
+
+        self.assertEqual(run.successful_rows, 1)
+        self.assertEqual(run.skipped_rows, 1)
+        self.assertEqual(Transaction.objects.count(), 4)
+
+    def test_import_skips_previous_hash_of_a_first_transaction_repeated_later(self):
+        # The previous hash included the header in the first transaction, so a
+        # first transaction and an identical later one were both imported
+        content = """!Type:Bank
+D05/01/2015
+T-4.50
+PCoffee Shop
+^
+D05/01/2015
+T-4.50
+PCoffee Shop
+^
+"""
+        for raw_content in (
+            "!Type:BankD05/01/2015T-4.50PCoffee Shop^",
+            "D05/01/2015T-4.50PCoffee Shop^",
+        ):
+            Transaction.objects.create(
+                account=self.account,
+                type=Transaction.Type.EXPENSE,
+                date=date(2015, 1, 5),
+                amount=Decimal("4.50"),
+                internal_id=hashlib.sha256(raw_content.encode("utf-8")).hexdigest(),
+            )
+
+        run = self._import_qif(content)
+
+        self.assertEqual(run.successful_rows, 0)
+        self.assertEqual(run.skipped_rows, 2)
+        self.assertEqual(Transaction.objects.count(), 2)
+
+    def test_import_skips_account_blocks(self):
+        # Quicken-style export: an account list, then an account block before
+        # the transactions. T and D mean the account type and description there
+        content = """!Option:AutoSwitch
+!Account
+NChecking
+TBank
+DMain checking account
+^
+NSavings
+TBank
+^
+!Clear:AutoSwitch
+!Account
+NChecking
+TBank
+DMain checking account
+^
+!Type:Bank
+D04/01/2015
+T100.00
+PSalary
+^
+"""
+        run = self._import_qif(content)
+
+        self.assertEqual(run.status, ImportRun.Status.FINISHED)
+        self.assertEqual(run.successful_rows, 1)
+        self.assertEqual(run.failed_rows, 0)
+        transaction = Transaction.objects.get()
+        self.assertEqual(transaction.amount, Decimal("100.00"))
+        self.assertEqual(transaction.date, date(2015, 1, 4))
+
+    def test_import_skips_non_transaction_sections(self):
+        # Category and class lists, and memorized transactions (templates, not
+        # real transactions), around a section of real ones
+        content = """!Type:Cat
+NFood
+DGroceries and restaurants
+E
+^
+!Type:Class
+NPersonal
+DPersonal expenses
+^
+!Type:Bank
+D04/01/2015
+T100.00
+PSalary
+^
+!Type:Memorized
+KC
+T-50.00
+PRent
+^
+"""
+        run = self._import_qif(content)
+
+        self.assertEqual(run.status, ImportRun.Status.FINISHED)
+        self.assertEqual(run.successful_rows, 1)
+        self.assertEqual(run.failed_rows, 0)
+        self.assertEqual(Transaction.objects.get().amount, Decimal("100.00"))
+
     @override_settings(ENABLE_SOFT_DELETE=True)
     def test_import_skips_soft_deleted_transactions(self):
         content = """!Type:Bank
